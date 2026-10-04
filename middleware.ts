@@ -1,0 +1,90 @@
+/**
+ * Shop Application Middleware
+ *
+ * Handles:
+ * 1. Theme App forwarding (L4): When activeTheme.type === 'app', proxy all requests to Theme App
+ * 2. Locale-based routing: Redirects requests without locale prefix to /{locale}/...
+ *
+ * Priority: Theme App forwarding > Locale redirect > Pass through
+ */
+
+import { LOCALES, DEFAULT_LOCALE } from 'shared/src/i18n';
+import { createProxyHandler, type ProxyConfig } from 'shared/src/proxy';
+import { NextResponse } from 'next/server';
+
+/**
+ * Shop proxy configuration
+ */
+const shopProxyConfig: ProxyConfig = {
+  target: 'shop',
+  defaultLocale: DEFAULT_LOCALE,
+  locales: LOCALES,
+};
+
+/**
+ * Shop middleware handler
+ *
+ * Request flow:
+ * 1. Check if path should never be forwarded (/api/*, /extensions/*, /uploads/*, /theme-app/*)
+ * 2. Check if Theme App mode is active -> rewrite to Theme App Gateway
+ * 3. Handle locale redirect if no locale prefix
+ * 4. Pass through
+ */
+const baseProxy = createProxyHandler(shopProxyConfig);
+type ProxyRequest = Parameters<typeof baseProxy>[0];
+
+function isInstallRootRequest(request: ProxyRequest): boolean {
+  const host = request.headers.get('host')?.split(':')[0]?.toLowerCase();
+  const pathname = request.nextUrl.pathname;
+
+  if (host !== 'get.jiffoo.com') {
+    return false;
+  }
+
+  return pathname === '/' || pathname === `/${DEFAULT_LOCALE}`;
+}
+
+function isOfficialArtifactRequest(request: ProxyRequest): boolean {
+  const host = request.headers.get('host')?.split(':')[0]?.toLowerCase();
+  return host === 'get.jiffoo.com' && request.nextUrl.pathname.startsWith('/official-artifacts/');
+}
+
+export function officialArtifactRedirect(request: ProxyRequest): NextResponse | null {
+  if (!isOfficialArtifactRequest(request)) return null;
+  const target = new URL(`https://artifacts.jiffoo.com${request.nextUrl.pathname}`);
+  target.search = request.nextUrl.search;
+  return NextResponse.redirect(target, 307);
+}
+
+export async function middleware(request: ProxyRequest) {
+  const artifactRedirect = officialArtifactRedirect(request);
+  if (artifactRedirect) return artifactRedirect;
+
+  if (isInstallRootRequest(request)) {
+    return NextResponse.redirect(new URL('/install.sh', request.url));
+  }
+
+  return baseProxy(request);
+}
+
+/**
+ * Matcher configuration
+ *
+ * IMPORTANT: This matcher MUST NOT exclude /_next/* because Theme App mode
+ * needs to forward static resources to the Theme App server.
+ *
+ * Excluded paths:
+ * - /api/* - Core API routes (prevents infinite loop)
+ * - /plugins/* - Plugin runtime mount for storefront slots
+ * - /extensions/* - Extension static files
+ * - /uploads/* - Upload files
+ * - /media/* - Core API media (proxied by app/media route handler; the locale
+ *   redirect must not prefix it, the path has no route in the shop app)
+ * - /theme-app/* - Theme App Gateway (prevents infinite loop)
+ * - favicon.ico - Browser default request
+ *
+ * NOTE: Next.js requires matcher to be a static literal, cannot be imported.
+ */
+export const config = {
+  matcher: ['/((?!api/|plugins/|extensions/|uploads/|media/|theme-app/|favicon.ico).*)'],
+};
